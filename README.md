@@ -121,22 +121,6 @@ A lightweight, **private WHOIS + DNS lookup** tool implemented as a single PHP f
 
 ---
 
-## 🖼️ Branding (logo & favicon)
-
-- Place your **logo** at the web root as `/logo.png`
-- Place your **favicon** at the web root as `/favicon.ico`
-
-Both are referenced automatically by the UI:
-
-```html
-<img class="logo" src="/logo.png" alt="Site logo" width="28" height="28">
-<link rel="icon" href="/favicon.ico" sizes="any">
-```
-
-> Prefer to keep assets inside `whois/`? Put them there and update the paths in `index.php` accordingly.
-
----
-
 ## 🖥️ Deployment notes (Apache / Nginx)
 
 - Ensure `open_basedir` includes the site root (Plesk default is fine)
@@ -144,19 +128,6 @@ Both are referenced automatically by the UI:
 - No .htaccess rules are required; the app is a single `index.php`
 
 **Nginx proxy** (typical): nothing special needed—static `/logo.png` and `/favicon.ico` are served from the docroot.
-
----
-
-## 🧪 Test cases
-
-Try these to validate behavior:
-
-- `example.com` (always works; ICANN WHOIS)
-- `heise.de` (DENIC formatting)
-- `mogaso.eu` (EU registry)
-- `bücher.de` (IDN)
-- `www.heise.de` (subdomain)
-- `1.1.1.1` (IP – reverse lookup only, WHOIS for IP intentionally not implemented)
 
 ---
 
@@ -230,31 +201,6 @@ Append `&format=json` for machine-readable output.
 
 ---
 
-## 🧯 Troubleshooting
-
-- **HTTP 500** on first run:
-  - Ensure `whois/cache/` exists and is writable by PHP
-  - Confirm PHP is **8.1+** and `dns_get_record` is available
-  - If you need to debug temporarily, uncomment at the top of the file:
-    ```php
-    // ini_set('display_errors','1'); error_reporting(E_ALL);
-    ```
-    *(Remember to disable again for production.)*
-
-- **Empty WHOIS** for some TLDs:
-  - Some registries restrict Port-43 WHOIS or require specific flags
-  - The app already queries IANA and follows referrals if present
-
-- **IDN issues**:
-  - Install/enable the `intl` extension to ensure robust IDN conversion
-  - Without `intl`, the app still runs but may show a conversion note or reduced IDN handling
-
-- **Slow DNS**:
-  - PHP uses the system resolver; timeouts depend on OS resolver settings
-  - Overall script timeout is limited to 10s
-
----
-
 ## 🔎 Accessibility
 
 - Proper labels, roles (`role="tablist"`, `role="tabpanel"`), `aria-selected`
@@ -262,15 +208,6 @@ Append `&format=json` for machine-readable output.
 - Focus outlines and high-contrast tokens
 - Mobile: large touch targets; tables scroll horizontally
 
----
-
-## 📄 License
-
-Choose a license appropriate for your project (e.g., MIT):
-
-```
-MIT License — Copyright (c) <year> <your name>
-```
 
 ---
 
@@ -283,15 +220,3 @@ This is a single-file utility; feel free to open issues/PRs with:
 
 ---
 
-## ✅ Checklist (before going live)
-
-- [ ] PHP 8.1+ selected for the domain
-- [ ] `whois/cache/` is writable
-- [ ] `/logo.png` and `/favicon.ico` placed at web root
-- [ ] `intl` extension enabled (optional, improves IDN)
-- [ ] Verified with test cases (see above)
-- [ ] Debug output disabled in production
-
----
-
-### Enjoy your fast, private WHOIS & DNS lookup!
