@@ -1,10 +1,40 @@
 <?php
 declare(strict_types=1);
 
-// --- (optional) TEMP DEBUG ---
-// ini_set('display_errors','1'); error_reporting(E_ALL);
+/**
+ * Single-file WHOIS & DNS Lookup — index.php
+ * Environment: PHP 8.1+ (intl recommended for IDN), no external tools/CLI.
+ * Location: /httpdocs/whois/index.php
+ * Cache dir: /httpdocs/whois/cache/
+ *
+ * NOTE:
+ * - This file implements WHOIS (Port 43) and DNS lookups with caching, rate limiting,
+ *   and a modern, responsive UI (dark-mode first). All user-visible text is German,
+ *   but code comments are in English as requested.
+ */
 
-// --- Polyfills für ältere PHPs (harmlos unter 8.3) ---
+/* -------------------------
+ * Security Response Headers
+ * ------------------------- */
+header("Referrer-Policy: same-origin");
+header("X-Content-Type-Options: nosniff");
+/* CSP allows inline CSS/JS for this single-file app by design. Images are local ('self') or data: */
+header("Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'");
+
+/* -------------------------
+ * Runtime Environment
+ * ------------------------- */
+date_default_timezone_set('Europe/Berlin');          // localize timestamps
+ini_set('default_socket_timeout', '5');              // WHOIS TCP socket timeout
+set_time_limit(10);                                  // overall hard cap
+
+$SCRIPT_DIR = __DIR__;
+$CACHE_DIR  = $SCRIPT_DIR . DIRECTORY_SEPARATOR . 'cache';
+if (!is_dir($CACHE_DIR)) @mkdir($CACHE_DIR, 0755, true);
+
+/* -------------------------
+ * Polyfills (harmless on 8.3)
+ * ------------------------- */
 if (!function_exists('str_starts_with')) {
   function str_starts_with(string $haystack, string $needle): bool {
     return $needle !== '' && strncmp($haystack, $needle, strlen($needle)) === 0;
@@ -16,36 +46,14 @@ if (!function_exists('str_contains')) {
   }
 }
 
-/**
- * Single-file WHOIS & DNS Lookup — index.php
- * Requirements: PHP 8.1+, intl empfohlen (für IDN), keine externen Tools.
- * Place: httpdocs/whois/index.php   |   Cache: httpdocs/whois/cache/
- */
+/* -------------------------
+ * Utility Helpers
+ * ------------------------- */
 
-///////////////////////
-// Security Headers  //
-///////////////////////
-header("Referrer-Policy: same-origin");
-header("X-Content-Type-Options: nosniff");
-// Inline CSS/JS nötig -> 'unsafe-inline' bewusst gesetzt (nur eigene Seite)
-header("Content-Security-Policy: default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; base-uri 'none'; form-action 'self'");
-
-///////////////////////
-// Environment       //
-///////////////////////
-date_default_timezone_set('Europe/Berlin');
-ini_set('default_socket_timeout', '5'); // WHOIS sockets
-set_time_limit(10); // Gesamtbudget
-
-$SCRIPT_DIR = __DIR__;
-$CACHE_DIR  = $SCRIPT_DIR . DIRECTORY_SEPARATOR . 'cache';
-if (!is_dir($CACHE_DIR)) @mkdir($CACHE_DIR, 0755, true);
-
-///////////////////////
-// Utilities         //
-///////////////////////
+/** HTML-escape helper */
 function h(?string $s): string { return htmlspecialchars($s ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
+/** Resolve best-effort client IP for rate limiting */
 function clientIp(): string {
     foreach (['HTTP_CLIENT_IP','HTTP_X_FORWARDED_FOR','REMOTE_ADDR'] as $k) {
         if (!empty($_SERVER[$k])) {
@@ -56,6 +64,7 @@ function clientIp(): string {
     return '0.0.0.0';
 }
 
+/** Private IP detection for IPv4/IPv6 (SSRF hardening) */
 function isIpPrivate(string $ip): bool {
     if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
         $long = ip2long($ip);
@@ -72,6 +81,7 @@ function isIpPrivate(string $ip): bool {
     return false;
 }
 
+/** Safely convert Unicode host to ASCII (Punycode), note conversion state */
 function idnToAsciiSafe(string $host): array {
     $unicode = $host;
     $host = trim($host, " \t\n\r\0\x0B.");
@@ -85,7 +95,7 @@ function idnToAsciiSafe(string $host): array {
 
         $converted = @idn_to_ascii($host, $flags, $variant);
         if ($converted === false) {
-            // Fallback: ohne Flags/Variant versuchen
+            // Fallback attempt without flags/variant
             $converted = @idn_to_ascii($host);
         }
         if ($converted !== false) {
@@ -100,10 +110,12 @@ function idnToAsciiSafe(string $host): array {
     return [$ascii, $unicode, $note];
 }
 
+/** RFC label validation (ASCII) */
 function isValidAsciiLabel(string $label): bool {
     return (bool)preg_match('/^(?!-)[A-Za-z0-9-]{1,63}(?<!-)$/', $label);
 }
 
+/** Validate input (IP or FQDN, reject URLs). Returns structured type info. */
 function validateInput(string $q): array {
     $q = trim($q);
     if ($q === '') return ['type'=>'invalid','error'=>'Leere Eingabe'];
@@ -111,11 +123,11 @@ function validateInput(string $q): array {
     if (filter_var($q, FILTER_VALIDATE_IP)) {
         return ['type'=>'ip','ip'=>$q];
     }
-    // URL versehentlich?
+    // Reject full URLs
     if (preg_match('~^[a-z]+://~i', $q)) {
         return ['type'=>'invalid','error'=>'Bitte nur Domain/Hostname oder IP, keine URLs.'];
     }
-    // Unicode Domain → ASCII
+    // Unicode to ASCII (Punycode)
     [$ascii, $unicode, $idnNote] = idnToAsciiSafe($q);
     $labels = explode('.', $ascii);
     if (count($labels) < 2) return ['type'=>'invalid','error'=>'Ungültige Domain (TLD fehlt).'];
@@ -124,7 +136,7 @@ function validateInput(string $q): array {
     return ['type'=>'domain','host_unicode'=>$unicode,'host'=>$ascii,'idn_note'=>$idnNote];
 }
 
-// registrable domain heuristic (for WHOIS): handles common 2LD TLDs
+/** Heuristic to derive registrable domain (handles some common 2LD public suffixes) */
 function registrableDomain(string $asciiDomain): string {
     $d = strtolower($asciiDomain);
     $parts = explode('.', $d);
@@ -142,19 +154,21 @@ function registrableDomain(string $asciiDomain): string {
         return implode('.', array_slice($parts, -3));
     }
     if (in_array($last3, $twoLevelTlds, true)) {
-        return implode('.', array_slice($parts, -4)); // extreme edge
+        return implode('.', array_slice($parts, -4)); // extreme edge-case
     }
     return implode('.', array_slice($parts, -2));
 }
 
+/** Extract TLD from ASCII domain */
 function tldOf(string $asciiDomain): string {
     $labels = explode('.', strtolower($asciiDomain));
     return end($labels);
 }
 
+/** Check that a hostname resolves to public IPs only (used for SSRF safety) */
 function isHostPublic(string $hostname): bool {
-    $ips = @dns_get_record($hostname, DNS_A | DNS_AAAA); // korrekt: bitweises OR
-    if (!$ips) return false; // treat unresolved as unsafe for SSRF
+    $ips = @dns_get_record($hostname, DNS_A | DNS_AAAA); // bitwise OR is correct
+    if (!$ips) return false; // unresolved → treat as unsafe
     foreach ($ips as $rec) {
         $ip = $rec['type'] === 'AAAA' ? ($rec['ipv6'] ?? null) : ($rec['type']==='A' ? ($rec['ip'] ?? null) : null);
         if (!$ip) continue;
@@ -163,9 +177,9 @@ function isHostPublic(string $hostname): bool {
     return true;
 }
 
+/** Low-level WHOIS over TCP (Port 43) with simple safety checks */
 function socketWhois(string $server, string $query, int $timeout = 5): array {
     $raw = '';
-    $err = null;
     if (!preg_match('/^[A-Za-z0-9\.\-]+$/', $server)) {
         return ['', 'WHOIS-Server ungültig gebildet.'];
     }
@@ -179,19 +193,19 @@ function socketWhois(string $server, string $query, int $timeout = 5): array {
     fwrite($fp, $query . "\r\n");
     while (!feof($fp)) {
         $raw .= fgets($fp, 2048);
-        if (strlen($raw) > 2_000_000) break; // safety limit
+        if (strlen($raw) > 2_000_000) break; // safety limit to avoid memory blowups
     }
     fclose($fp);
     return [$raw, null];
 }
 
+/** Ask IANA first to discover the registry WHOIS server; fallback for common TLDs */
 function ianaWhoisServer(string $tld): ?string {
-    // primary: IANA whois
     [$raw, $err] = socketWhois('whois.iana.org', $tld);
     if ($raw && preg_match('/\nwhois:\s*([^\s]+)\s*/i', $raw, $m)) {
         return trim($m[1]);
     }
-    // fallback map für häufige TLDs
+    // Minimal fallback map
     $map = [
         'com'=>'whois.verisign-grs.com',
         'net'=>'whois.verisign-grs.com',
@@ -206,6 +220,7 @@ function ianaWhoisServer(string $tld): ?string {
     return $map[$tld] ?? null;
 }
 
+/** Parse WHOIS text into a structured best-effort array */
 function parseWhois(string $raw): array {
     $lines = preg_split('/\r?\n/', $raw);
     $out = [
@@ -227,27 +242,27 @@ function parseWhois(string $raw): array {
         if ($kl === 'registrar iana id') $out['registrar']['iana_id'] = $v;
         if ($kl === 'registrar url' || $kl === 'registrar url ') $out['registrar']['url'] = $v;
         if (str_starts_with($kl, 'domain status')) $out['status'][] = $v;
-        if ($kl === 'status') $out['status'][] = $v; // DENIC
+        if ($kl === 'status') $out['status'][] = $v; // e.g., DENIC
         if (str_starts_with($kl, 'name server') || $kl==='nserver') $out['nameservers'][] = $v;
         if (in_array($kl, ['creation date','created','created on','created date'])) $out['dates']['created'] = $v;
         if (in_array($kl, ['updated date','changed','last updated','modified'])) $out['dates']['updated'] = $v;
         if (in_array($kl, ['registry expiry date','expiry date','expires','paid-till'])) $out['dates']['expiry'] = $v;
 
-        // contacts (best effort)
+        // contact buckets (best effort)
         if (str_starts_with($kl, 'registrant ')) $out['contacts']['registrant'][substr($k, 11)] = $v;
         if (str_starts_with($kl, 'admin '))      $out['contacts']['admin'][substr($k, 6)]       = $v;
         if (str_starts_with($kl, 'tech '))       $out['contacts']['tech'][substr($k, 5)]        = $v;
     }
-    // mask personal hints
     if (!empty($out['contacts'])) {
         $out['notice'] = 'WHOIS-Daten können durch Datenschutzrichtlinien eingeschränkt oder anonymisiert sein.';
     }
-    // normalize arrays
+    // normalize
     $out['nameservers'] = array_values(array_unique(array_map('trim', $out['nameservers'])));
     $out['status']      = array_values(array_unique(array_map('trim', $out['status'])));
     return $out;
 }
 
+/** Full WHOIS lookup: IANA → registry; optionally follow referral to registrar WHOIS */
 function whoisLookup(string $domainAscii, bool $fast=false): array {
     $tld = tldOf($domainAscii);
     $server = ianaWhoisServer($tld);
@@ -256,11 +271,12 @@ function whoisLookup(string $domainAscii, bool $fast=false): array {
     if (!$server) {
         return ['error'=>"Kein WHOIS-Server für .{$tld} gefunden (IANA-Abfrage fehlgeschlagen).", 'raw'=>$allRaw, 'meta'=>$meta];
     }
-    // Query registry
+    // Query registry WHOIS
     [$raw1, $err1] = socketWhois($server, $domainAscii);
     if ($err1) return ['error'=>$err1, 'raw'=>$allRaw, 'meta'=>$meta];
     $allRaw[] = "## WHOIS Server: {$server}\n".$raw1;
 
+    // Follow referral if present (skip in fast mode)
     $registrarServer = null;
     if (!$fast) {
         if (preg_match('/Registrar WHOIS Server:\s*([^\s]+)/i', $raw1, $m)) {
@@ -280,6 +296,7 @@ function whoisLookup(string $domainAscii, bool $fast=false): array {
     return ['parsed'=>$parsed, 'raw'=>$allRaw, 'meta'=>$meta];
 }
 
+/** DNS query wrapper for a single RR type */
 function dnsQueryType(string $host, int $type): array {
     $out = [];
     $records = @dns_get_record($host, $type, $auth, $add);
@@ -314,12 +331,13 @@ function dnsQueryType(string $host, int $type): array {
     return $out;
 }
 
+/** Aggregate DNS across a set of RR types; add PTR (reverse) attempts for A/AAAA and DNSSEC hints */
 function dnsLookupAll(string $host, bool $fast=false): array {
     $result = [
         'A'=>[], 'AAAA'=>[], 'CNAME'=>[], 'NS'=>[], 'MX'=>[], 'TXT'=>[], 'SOA'=>[], 'SRV'=>[], 'CAA'=>[],
         'PTR'=>[], 'dnssec'=>['has_ds'=>false,'has_rrsig'=>false]
     ];
-    // fast: only A/AAAA
+    // Fast mode → only A/AAAA
     $types = $fast ? ['A'=>DNS_A,'AAAA'=>DNS_AAAA] : [
         'A'=>DNS_A,'AAAA'=>DNS_AAAA,'CNAME'=>DNS_CNAME,'NS'=>DNS_NS,'MX'=>DNS_MX,'TXT'=>DNS_TXT,'SOA'=>DNS_SOA,
         'SRV'=>DNS_SRV,'CAA'=> (defined('DNS_CAA')? DNS_CAA : 8192)
@@ -327,7 +345,7 @@ function dnsLookupAll(string $host, bool $fast=false): array {
     foreach ($types as $name=>$flag) {
         $result[$name] = dnsQueryType($host, $flag);
     }
-    // DNSSEC hints
+    // DNSSEC flags (if php defines are available)
     if (!$fast) {
         if (defined('DNS_DS')) {
             $ds = dnsQueryType($host, DNS_DS);
@@ -338,7 +356,7 @@ function dnsLookupAll(string $host, bool $fast=false): array {
             $result['dnssec']['has_rrsig'] = !empty($sig);
         }
     }
-    // PTR für A/AAAA
+    // PTR per resolved A/AAAA
     $ips = [];
     foreach ($result['A'] as $r)   if (!empty($r['ip']))   $ips[] = $r['ip'];
     foreach ($result['AAAA'] as $r)if (!empty($r['ipv6'])) $ips[] = $r['ipv6'];
@@ -351,9 +369,9 @@ function dnsLookupAll(string $host, bool $fast=false): array {
     return $result;
 }
 
-///////////////////////
-// Rate Limiting     //
-///////////////////////
+/* -------------------------
+ * Rate Limiting (file-based)
+ * ------------------------- */
 function rateLimitCheck(string $cacheDir, string $ip, int $limit=30, int $windowSec=300): ?string {
     $f = $cacheDir . DIRECTORY_SEPARATOR . 'ratelimit_' . preg_replace('/[^0-9A-Fa-f:\.]/','_', $ip) . '.json';
     $now = time();
@@ -370,9 +388,9 @@ function rateLimitCheck(string $cacheDir, string $ip, int $limit=30, int $window
     return null;
 }
 
-///////////////////////
-// Controller        //
-///////////////////////
+/* -------------------------
+ * Controller (request flow)
+ * ------------------------- */
 $q      = isset($_GET['q']) ? trim((string)$_GET['q']) : '';
 $fast   = isset($_GET['fast']) && ($_GET['fast']==='1' || $_GET['fast']==='true');
 $force  = isset($_GET['force']) && ($_GET['force']==='1' || $_GET['force']==='true');
@@ -384,16 +402,16 @@ $data   = null;
 $usedCache = false;
 
 if ($q !== '') {
-    // Rate limit
+    // Rate limit per IP
     $rl = rateLimitCheck($CACHE_DIR, clientIp());
     if ($rl) $errors[] = $rl;
 
-    // Validate
+    // Validate input
     $val = validateInput($q);
     if ($val['type'] === 'invalid') {
         $errors[] = $val['error'];
     } else {
-        // Cache key
+        // Cache key decision
         $cacheKey = '';
         if ($val['type'] === 'ip') {
             $cacheKey = 'ip__'.str_replace(':','_',str_replace('.','_',$val['ip'])).($fast?'_f':'');
@@ -404,16 +422,18 @@ if ($q !== '') {
         $cacheJson = $CACHE_DIR . DIRECTORY_SEPARATOR . $cacheKey . '.json';
         $cacheRaw  = $CACHE_DIR . DIRECTORY_SEPARATOR . $cacheKey . '.whois.txt';
 
+        // Use cache if fresh (≤ 15 minutes)
         if (!$force && is_file($cacheJson) && (time() - filemtime($cacheJson) < 900)) {
             $data = json_decode((string)@file_get_contents($cacheJson), true);
             if (is_array($data)) { $usedCache = true; }
         }
+        // Perform fresh lookups if needed
         if (!$data) {
             $result = ['meta'=>[
                 'input'=>$q, 'type'=>$val['type'], 'fast'=>$fast, 'timestamp'=>$nowIso, 'cache'=>'fresh'
             ]];
             if ($val['type'] === 'ip') {
-                // Only PTR for IP
+                // WHOIS for IP is intentionally not implemented (many RIR formats)
                 $ip = $val['ip'];
                 $ptr = @gethostbyaddr($ip);
                 $result['overview'] = [
@@ -426,9 +446,9 @@ if ($q !== '') {
                 $result['network'] = ['ptr'=>$result['dns']['PTR']];
                 $rawDump = '';
             } else {
-                $hostAscii = $val['host'];
+                $hostAscii   = $val['host'];
                 $hostUnicode = $val['host_unicode'];
-                $regdom = registrableDomain($hostAscii);
+                $regdom      = registrableDomain($hostAscii);
 
                 $who = whoisLookup($regdom, $fast);
                 $dns = dnsLookupAll($hostAscii, $fast);
@@ -457,11 +477,11 @@ if ($q !== '') {
                 $result['meta']['idn_note'] = $val['idn_note'] ?? null;
             }
             $data = $result;
-            // Save cache
+            // Persist cache artifacts
             @file_put_contents($cacheJson, json_encode($data, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE));
             @file_put_contents($cacheRaw, $rawDump ?? '');
         }
-        // attach cache info
+        // Attach cache markers
         if ($data && isset($data['meta'])) {
             $data['meta']['cache'] = $usedCache ? 'cache' : 'fresh';
             $data['meta']['cached_at'] = @date('c', @filemtime($cacheJson) ?: time());
@@ -469,7 +489,9 @@ if ($q !== '') {
     }
 }
 
-// JSON export
+/* -------------------------
+ * JSON export
+ * ------------------------- */
 if ($format === 'json') {
     header('Content-Type: application/json; charset=UTF-8');
     if (!empty($errors)) {
@@ -480,7 +502,7 @@ if ($format === 'json') {
     exit;
 }
 
-// Helper for title
+/* Page <title> decoration */
 $pagetitle = 'WHOIS & DNS Lookup';
 if ($q !== '' && empty($errors)) {
     $disp = $data['overview']['domain_or_ip'] ?? $q;
@@ -495,7 +517,12 @@ if ($q !== '' && empty($errors)) {
 <meta name="color-scheme" content="dark light">
 <meta name="theme-color" content="#0b1220">
 <title><?=h($pagetitle)?></title>
-<link rel="icon" href="data:image/svg+xml,<?=rawurlencode('<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22><defs><linearGradient id=%22g%22 x1=%220%22 x2=%221%22 y1=%220%22 y2=%221%22><stop stop-color=%22#22d3ee%22/><stop offset=%221%22 stop-color=%22#0ea5e9%22/></linearGradient></defs><rect rx=%2212%22 width=%2264%22 height=%2264%22 fill=%22#0b1220%22/><path d=%22M32 10c10 0 18 8 18 18s-8 18-18 18S14 38 14 28 22 10 32 10Zm0 6c6 0 12 6 12 12s-6 12-12 12-12-6-12-12 6-12 12-12Z%22 fill=%22url(#g)%22/></svg>')?>">
+
+<!-- Favicon (requested path: /httpdocs/favicon.ico => URL /favicon.ico) -->
+<link rel="icon" href="favicon.ico" sizes="any">
+<!-- Optional: also expose PNG logo as icon fallback -->
+<link rel="icon" type="image/png" href="/logo.png">
+
 <style>
 /* ====== Design Tokens ====== */
 :root{
@@ -515,7 +542,7 @@ body{margin:0;font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial,
 header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,rgba(11,18,32,.85),rgba(11,18,32,.60) 60%,transparent);backdrop-filter:saturate(140%) blur(6px);padding:10px 0 8px;margin:-18px -18px 8px;box-shadow:inset 0 -1px 0 rgba(148,163,184,.15)}
 .header-inner{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:0 18px}
 .brand{display:flex;gap:10px;align-items:center}
-.logo{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,var(--accent),var(--accent-2));box-shadow:0 6px 14px rgba(14,165,233,.35)}
+.logo{width:28px;height:28px;border-radius:8px;object-fit:cover;box-shadow:0 6px 14px rgba(14,165,233,.35)}
 .title{font-weight:800;font-size:18px;letter-spacing:.2px}
 .meta{color:var(--muted);font-size:12px}
 
@@ -539,6 +566,7 @@ header{position:sticky;top:0;z-index:10;background:linear-gradient(180deg,rgba(1
 .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0 8px}
 .tab{padding:8px 14px;border-radius:999px;border:1px solid rgba(148,163,184,.25);cursor:pointer;position:relative}
 .tab.active{color:white;background:linear-gradient(135deg,var(--accent),var(--accent-2));border-color:transparent;box-shadow:0 6px 18px rgba(14,165,233,.35)}
+
 /* ====== Cards & Grid ====== */
 .grid{display:grid;grid-template-columns:1fr;gap:14px;margin-top:10px}
 @media(min-width:920px){.grid{grid-template-columns:1fr 1fr}}
@@ -582,7 +610,8 @@ td.wrap{white-space:normal;word-break:break-word}
   <header>
     <div class="header-inner">
       <div class="brand">
-        <div class="logo" aria-hidden="true"></div>
+        <!-- LOGO (requested path: /httpdocs/logo.png => URL /logo.png) -->
+        <img class="logo" src="/whois/logo.png" alt="Site logo" width="30" height="40" loading="eager" decoding="async">
         <div class="title">WHOIS & DNS Lookup</div>
       </div>
       <div class="meta"><?=h($nowIso)?></div>
@@ -790,8 +819,7 @@ td.wrap{white-space:normal;word-break:break-word}
                     case 'CNAME':case 'NS': case 'PTR': echo h($r['target']??''); break;
                     case 'MX':   echo 'pri '.h((string)($r['pri']??'')) . ' → ' . h($r['target']??''); break;
                     case 'TXT':  echo h($r['txt']??''); break;
-                    case 'SOA':  echo 'mname '.h($r['mname']??'').' · rname '.h($r['rname']??'').' · serial '.h((string)($r['serial']??'')).
-                      ' · refresh '.h((string)($r['refresh']??'')).' · retry '.h((string)($r['retry']??'')).' · expire '.h((string)($r['expire']??'')).' · min '.h((string)($r['minimum']??'')); break;
+                    case 'SOA':  echo 'mname '.h($r['mname']??'').' · rname '.h($r['rname']??'').' · serial '.h((string)($r['serial']??'')).' · refresh '.h((string)($r['refresh']??'')).' · retry '.h((string)($r['retry']??'')).' · expire '.h((string)($r['expire']??'')).' · min '.h((string)($r['minimum']??'')); break;
                     case 'SRV':  echo 'pri '.h((string)($r['pri']??'')).' · weight '.h((string)($r['weight']??'')).' · port '.h((string)($r['port']??'')).' → '.h($r['target']??''); break;
                     case 'CAA':  echo 'flags '.h((string)($r['flags']??'')).' · tag '.h($r['tag']??'').' · value '.h((string)($r['value']??'')); break;
                     default: echo '';
@@ -850,18 +878,19 @@ td.wrap{white-space:normal;word-break:break-word}
 <div class="toast" id="toast" role="status" aria-live="polite">In Zwischenablage kopiert</div>
 
 <script>
+/* Tiny DOM helpers */
 const $ = sel => document.querySelector(sel);
 const $$ = sel => Array.from(document.querySelectorAll(sel));
 
-// Focus & autoselect
+/* Auto-focus input, tabs logic, clipboard copy, share link */
 window.addEventListener('load', () => {
+  // Focus & autoselect query field
   const q = $('#q'); if (q && !q.value) { q.focus(); q.select(); }
 
-  // Tabs (click + keyboard)
+  // Tabs (click + basic keyboard nav)
   const tabs = $$('.tab');
   function activateTab(id){
-    tabs.forEach(t=>t.classList.remove('active'));
-    tabs.forEach(t=>t.setAttribute('aria-selected','false'));
+    tabs.forEach(t=>{ t.classList.remove('active'); t.setAttribute('aria-selected','false'); });
     const btn = tabs.find(t=>t.dataset.tab===id); if(btn){ btn.classList.add('active'); btn.setAttribute('aria-selected','true'); }
     ['tab-overview','tab-whois','tab-dns','tab-net','tab-raw'].forEach(x=>{
       const el = $('#'+x); if (el) el.style.display = (x===id)?'grid':'none';
@@ -878,7 +907,7 @@ window.addEventListener('load', () => {
     });
   });
 
-  // Copy buttons
+  // Copy buttons with toast
   const toast = $('#toast');
   function showToast(msg){ toast.textContent=msg; toast.classList.add('show'); setTimeout(()=>toast.classList.remove('show'),1200); }
   $$('.tool[data-copy-target]').forEach(btn=>{
@@ -891,10 +920,9 @@ window.addEventListener('load', () => {
     });
   });
 
-  // Share / link copy
+  // Share / link copy keeping only q & fast
   $('#shareBtn')?.addEventListener('click', async ()=>{
     const url = new URL(window.location.href);
-    // keep q & fast only
     const qv = $('#q')?.value || '';
     if (qv) url.searchParams.set('q', qv);
     const fast = document.querySelector('input[name="fast"]')?.checked;
